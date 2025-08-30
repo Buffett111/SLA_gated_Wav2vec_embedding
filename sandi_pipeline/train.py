@@ -27,6 +27,8 @@ from .model import (
     Wav2Vec2BackboneConfig,
     triplet_loss,
 )
+from .data import CollatorConfig as _CollatorConfig
+from .data import AudioCollator as _AudioCollator
 
 
 @dataclass
@@ -226,14 +228,8 @@ def stage2_train_regressor(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter
             train_loader = DataLoader(Subset(ds, train_idx), batch_size=cfg.batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(Subset(ds, val_idx), batch_size=cfg.batch_size, shuffle=False, collate_fn=collator)
 
-    # Determine feature dim via dummy forward
-    with torch.no_grad():
-        dummy = collator([
-            {"waveform": torch.zeros(16000), "sampling_rate": 16000, "score": 0.0, "id": "dummy"}
-        ])
-        dummy = {k: (v.to(cfg.device) if isinstance(v, torch.Tensor) else v) for k, v in dummy.items()}
-        frames = backbone(dummy["input_values"], attention_mask=dummy.get("attention_mask"))
-        feature_dim = frames.shape[-1]
+    # Determine feature dim from backbone config to avoid synthetic forward shape issues
+    feature_dim = backbone.model.config.hidden_size
 
     reg = Regressor(feature_dim).to(cfg.device)
     criterion = nn.MSELoss()
@@ -311,10 +307,50 @@ def stage2_train_regressor(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter
     torch.save(reg.state_dict(), os.path.join(cfg.out_dir, "regressor.pt"))
 
 
+def _export_embeddings_after_stage1(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter: GatedLinearAdapter, aggregator: TemporalAggregator) -> None:
+    os.makedirs(os.path.join(cfg.out_dir, "embeddings_stage1"), exist_ok=True)
+    raw = load_sandi_dataset(cfg.dataset_name)
+    splits = ["train", "dev"] if isinstance(raw, DatasetDict) else [None]
+    for split in splits:
+        d = raw[split] if split is not None else raw
+        sc = autodetect_score_column(d)
+        ds = AudioScoreDataset(d, sc)
+        collator = _AudioCollator(_CollatorConfig(model_name=cfg.model_name, max_seconds=cfg.max_seconds, chunk_seconds=cfg.chunk_seconds))
+        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collator)
+        out_dir = os.path.join(cfg.out_dir, "embeddings_stage1", split or "all")
+        os.makedirs(out_dir, exist_ok=True)
+        import numpy as np
+        meta = []
+        with torch.no_grad():
+            for batch in loader:
+                batch = {k: (v.to(cfg.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+                frames = backbone(batch["input_values"], attention_mask=batch.get("attention_mask"))
+                gated = adapter(frames)
+                e = aggregator(gated, attention_mask=batch.get("attention_mask"))
+                if "owner_idx" in batch and "num_examples" in batch:
+                    e = _aggregate_chunked_embeddings(e, batch["owner_idx"].to(e.device), int(batch["num_examples"]))
+                e_np = e.detach().cpu().numpy().astype("float32")
+                for i in range(e_np.shape[0]):
+                    uid = str(batch["ids"][i]) if i < len(batch["ids"]) else f"idx_{len(meta)}"
+                    p = os.path.join(out_dir, f"{uid}.npy")
+                    np.save(p, e_np[i])
+                    meta.append({"id": uid, "path": p, "score": float(batch["scores"][i].item())})
+        import json
+        with open(os.path.join(out_dir, "metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"[Export] Saved {len(meta)} embeddings to {out_dir}")
+
+
 def train_all(cfg: Optional[TrainConfig] = None):
     cfg = cfg or TrainConfig()
     set_seed(cfg.seed)
     backbone, adapter, aggregator, ds_pack = stage1_train_adapter(cfg)
+
+    # Export utterance-level embeddings E for reuse before training the regressor
+    try:
+        _export_embeddings_after_stage1(cfg, backbone, adapter, aggregator)
+    except Exception as e:
+        print(f"[Warn] Export embeddings failed: {e}")
     stage2_train_regressor(cfg, backbone, adapter, aggregator, ds_pack)
 
 
