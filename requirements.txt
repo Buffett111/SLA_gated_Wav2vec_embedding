@@ -1,0 +1,14 @@
+# https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.2/flash_attn-2.8.2+cu12torch2.7cxx11abiTRUE-cp311-cp311-linux_x86_64.whl
+flash_attn
+transformers==4.48.2
+accelerate
+librosa
+soundfile
+pillow
+scipy
+backoff
+peft==0.13.2
+sacrebleu
+datasets==3.6.0
+tensorboard
+einops
