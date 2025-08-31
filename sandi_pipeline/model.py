@@ -29,6 +29,47 @@ class Wav2Vec2Backbone(nn.Module):
             for p in self.model.parameters():
                 p.requires_grad = False
 
+    def _get_encoder_layers(self):
+        # Handle common wav2vec2 model structures
+        if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "layers"):
+            return self.model.encoder.layers
+        if (
+            hasattr(self.model, "wav2vec2")
+            and hasattr(self.model.wav2vec2, "encoder")
+            and hasattr(self.model.wav2vec2.encoder, "layers")
+        ):
+            return self.model.wav2vec2.encoder.layers
+        return None
+
+    def _get_feature_extractor(self):
+        if hasattr(self.model, "feature_extractor"):
+            return self.model.feature_extractor
+        if hasattr(self.model, "wav2vec2") and hasattr(self.model.wav2vec2, "feature_extractor"):
+            return self.model.wav2vec2.feature_extractor
+        return None
+
+    def freeze_all(self) -> None:
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+    def unfreeze_last_encoder_layers(self, num_layers: int, freeze_feature_extractor: bool = True) -> None:
+        """Unfreeze the last N transformer encoder layers. CNN feature extractor stays frozen by default."""
+        self.freeze_all()
+        fe = self._get_feature_extractor()
+        if fe is not None:
+            if freeze_feature_extractor:
+                for p in fe.parameters():
+                    p.requires_grad = False
+            else:
+                for p in fe.parameters():
+                    p.requires_grad = True
+        layers = self._get_encoder_layers()
+        if layers is not None and num_layers > 0:
+            take = min(num_layers, len(layers))
+            for layer in list(layers)[-take:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+
     def forward(self, input_values: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         out = self.model(input_values=input_values, attention_mask=attention_mask)
         if self.config.output_hidden_states:
@@ -41,6 +82,30 @@ class Wav2Vec2Backbone(nn.Module):
         else:
             feats = out.last_hidden_state
         return feats  # (B, T, D)
+
+    @torch.no_grad()
+    def make_frame_mask(self, input_attention_mask: Optional[torch.Tensor], frames: torch.Tensor) -> torch.Tensor:
+        """Build frame-level mask (B,T) from input sample-level attention mask (B,L).
+
+        For Wav2Vec2, feature frames T are shorter than input length L due to striding.
+        This uses the model's internal feature-extractor length computation when available,
+        and falls back to proportional scaling otherwise.
+        """
+        B, T = frames.shape[:2]
+        if input_attention_mask is None:
+            return torch.ones(B, T, device=frames.device, dtype=torch.long)
+        input_attention_mask = input_attention_mask.to(frames.device)
+        input_lengths = input_attention_mask.long().sum(dim=1)
+        try:
+            feat_lengths = self.model._get_feat_extract_output_lengths(input_lengths).to(frames.device)
+        except Exception:
+            # Fallback: scale proportionally to the produced sequence length
+            L = input_attention_mask.shape[1]
+            feat_lengths = (input_lengths.float() * (T / max(1, L))).round().long()
+        feat_lengths = torch.clamp(feat_lengths, min=0, max=T)
+        arange_t = torch.arange(T, device=frames.device).unsqueeze(0)
+        frame_mask = (arange_t < feat_lengths.unsqueeze(1)).long()
+        return frame_mask
 
 
 class GatedLinearAdapter(nn.Module):
@@ -99,9 +164,17 @@ class TemporalAggregator(nn.Module):
 
 
 class Regressor(nn.Module):
-    def __init__(self, feature_dim: int):
+    def __init__(self, feature_dim: int, hidden_dim: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
-        self.head = nn.Linear(feature_dim, 1)
+        if hidden_dim is None or hidden_dim <= 0:
+            self.head = nn.Linear(feature_dim, 1)
+        else:
+            self.head = nn.Sequential(
+                nn.Linear(feature_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
 
     def forward(self, e: torch.Tensor) -> torch.Tensor:
         return self.head(e).squeeze(-1)

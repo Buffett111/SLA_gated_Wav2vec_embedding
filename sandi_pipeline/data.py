@@ -5,7 +5,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from datasets import Audio, Dataset, DatasetDict, load_dataset
-from transformers import AutoProcessor
+from transformers import AutoFeatureExtractor, AutoProcessor
 
 
 DEFAULT_DATASET = "ntnu-smil/sandi-corpus-2025"
@@ -131,7 +131,12 @@ class AudioCollator:
     """
 
     def __init__(self, config: CollatorConfig):
-        self.processor = AutoProcessor.from_pretrained(config.model_name)
+        # Some wav2vec2 checkpoints (e.g., wav2vec2-large-xlsr-53) ship only a feature extractor,
+        # not a tokenizer. Prefer AutoFeatureExtractor and fall back to AutoProcessor.
+        try:
+            self.processor = AutoFeatureExtractor.from_pretrained(config.model_name)
+        except Exception:
+            self.processor = AutoProcessor.from_pretrained(config.model_name)
         self.max_samples = (
             int(config.max_seconds * config.target_sampling_rate) if config.max_seconds else None
         )

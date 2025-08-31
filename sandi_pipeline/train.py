@@ -34,8 +34,8 @@ from .data import AudioCollator as _AudioCollator
 @dataclass
 class TrainConfig:
     dataset_name: str = "ntnu-smil/sandi-corpus-2025"
-    model_name: str = "facebook/wav2vec2-base"
-    batch_size: int = 16
+    model_name: str = "facebook/wav2vec2-large-xlsr-53"
+    batch_size: int = 8
     max_seconds: Optional[float] = 30.0
     lr: float = 3e-4
     weight_decay: float = 0.01
@@ -49,6 +49,18 @@ class TrainConfig:
     out_dir: str = "./outputs"
     warmup_steps: int = 600
     seed: int = 42
+    # Stage-2 finetuning options
+    finetune_last_n_layers: int = 4
+    freeze_feature_extractor: bool = True
+    train_adapter_stage2: bool = True
+    train_aggregator_stage2: bool = True
+    backbone_lr: float = 1e-5
+    adapter_lr: float = 1e-4
+    aggregator_lr: float = 1e-4
+    regressor_lr: float = 3e-4
+    regressor_hidden_dim: Optional[int] = 512
+    regressor_dropout: float = 0.1
+    save_finetuned_backbone: bool = False
 
 
 def set_seed(seed: int) -> None:
@@ -76,10 +88,13 @@ def _aggregate_chunked_embeddings(e_chunks: torch.Tensor, owner_idx: torch.Tenso
 def compute_embeddings(backbone: Wav2Vec2Backbone, adapter: GatedLinearAdapter, aggregator: TemporalAggregator, batch):
     with torch.no_grad():
         frames = backbone(batch["input_values"], attention_mask=batch.get("attention_mask"))
+        frame_mask = backbone.make_frame_mask(batch.get("attention_mask"), frames)
     gated = adapter(frames)
-    e_chunks = aggregator(gated, attention_mask=batch.get("attention_mask"))
+    e_chunks = aggregator(gated, attention_mask=frame_mask)
     if "owner_idx" in batch and "num_examples" in batch:
-        e = _aggregate_chunked_embeddings(e_chunks, batch["owner_idx"].to(e_chunks.device), int(batch["num_examples"]))
+        num_ex = batch["num_examples"]
+        num_ex_int = int(num_ex.item()) if isinstance(num_ex, torch.Tensor) else int(num_ex)
+        e = _aggregate_chunked_embeddings(e_chunks, batch["owner_idx"].to(e_chunks.device), num_ex_int)
     else:
         e = e_chunks
     return e
@@ -169,9 +184,10 @@ def stage1_train_adapter(cfg: TrainConfig) -> tuple:
             # Backbone is frozen; run without grad to save memory
             with torch.no_grad():
                 frames = backbone(batch["input_values"], attention_mask=batch.get("attention_mask"))
+                frame_mask = backbone.make_frame_mask(batch.get("attention_mask"), frames)
             # Adapter + aggregator with grad
             gated = adapter(frames)
-            e = aggregator(gated, attention_mask=batch.get("attention_mask"))
+            e = aggregator(gated, attention_mask=frame_mask)
             if not did_check:
                 if not any(p.requires_grad for p in adapter.parameters()):
                     raise RuntimeError("Adapter parameters are not requiring grad; training would be no-op.")
@@ -228,12 +244,41 @@ def stage2_train_regressor(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter
             train_loader = DataLoader(Subset(ds, train_idx), batch_size=cfg.batch_size, shuffle=True, collate_fn=collator)
             val_loader = DataLoader(Subset(ds, val_idx), batch_size=cfg.batch_size, shuffle=False, collate_fn=collator)
 
+    # Optionally unfreeze last N encoder layers for finetuning
+    if cfg.finetune_last_n_layers and cfg.finetune_last_n_layers > 0:
+        try:
+            backbone.unfreeze_last_encoder_layers(cfg.finetune_last_n_layers, cfg.freeze_feature_extractor)
+        except Exception as e:
+            print(f"[Warn] Failed to unfreeze backbone layers: {e}")
+
     # Determine feature dim from backbone config to avoid synthetic forward shape issues
     feature_dim = backbone.model.config.hidden_size
 
-    reg = Regressor(feature_dim).to(cfg.device)
+    reg = Regressor(feature_dim, hidden_dim=cfg.regressor_hidden_dim, dropout=cfg.regressor_dropout).to(cfg.device)
     criterion = nn.MSELoss()
-    opt = torch.optim.AdamW(reg.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # Build parameter groups with per-module learning rates
+    param_groups = []
+    if cfg.finetune_last_n_layers and cfg.finetune_last_n_layers > 0:
+        pg_backbone = {"params": [p for p in backbone.parameters() if p.requires_grad], "lr": cfg.backbone_lr, "weight_decay": cfg.weight_decay}
+        if len(pg_backbone["params"]) > 0:
+            param_groups.append(pg_backbone)
+    if cfg.train_adapter_stage2:
+        for p in adapter.parameters():
+            p.requires_grad = True
+        param_groups.append({"params": adapter.parameters(), "lr": cfg.adapter_lr, "weight_decay": cfg.weight_decay})
+    else:
+        for p in adapter.parameters():
+            p.requires_grad = False
+    if cfg.train_aggregator_stage2:
+        for p in aggregator.parameters():
+            p.requires_grad = True
+        param_groups.append({"params": aggregator.parameters(), "lr": cfg.aggregator_lr, "weight_decay": cfg.weight_decay})
+    else:
+        for p in aggregator.parameters():
+            p.requires_grad = False
+    param_groups.append({"params": reg.parameters(), "lr": cfg.regressor_lr, "weight_decay": cfg.weight_decay})
+
+    opt = torch.optim.AdamW(param_groups)
 
     steps_per_epoch = max(1, math.ceil(len(train_loader)))
     total_steps = steps_per_epoch * cfg.epochs_regressor
@@ -248,11 +293,20 @@ def stage2_train_regressor(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter
         denom = 0
         for batch in train_loader:
             batch = {k: (v.to(cfg.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
-            with torch.no_grad():
-                frames = backbone(batch["input_values"], attention_mask=batch.get("attention_mask"))
-                gated = adapter(frames)
-                e = aggregator(gated, attention_mask=batch.get("attention_mask"))
-
+            frames = backbone(batch["input_values"], attention_mask=batch.get("attention_mask"))
+            frame_mask = backbone.make_frame_mask(batch.get("attention_mask"), frames)
+            gated = adapter(frames)
+            e = aggregator(gated, attention_mask=frame_mask)
+            if "owner_idx" in batch and "num_examples" in batch:
+                num_ex = batch["num_examples"]
+                num_ex_int = int(num_ex.item()) if isinstance(num_ex, torch.Tensor) else int(num_ex)
+                e = _aggregate_chunked_embeddings(
+                    e, batch["owner_idx"].to(e.device), num_ex_int
+                )
+            if e.size(0) != batch["scores"].size(0):
+                raise RuntimeError(
+                    f"Size mismatch: embeddings={e.size(0)} vs scores={batch['scores'].size(0)}"
+                )
             pred = reg(e)
             loss = criterion(pred, batch["scores"]) 
             opt.zero_grad()
@@ -274,8 +328,15 @@ def stage2_train_regressor(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter
             for batch in val_loader:
                 batch = {k: (v.to(cfg.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
                 frames = backbone(batch["input_values"], attention_mask=batch.get("attention_mask"))
+                frame_mask = backbone.make_frame_mask(batch.get("attention_mask"), frames)
                 gated = adapter(frames)
-                e = aggregator(gated, attention_mask=batch.get("attention_mask"))
+                e = aggregator(gated, attention_mask=frame_mask)
+                if "owner_idx" in batch and "num_examples" in batch:
+                    num_ex = batch["num_examples"]
+                    num_ex_int = int(num_ex.item()) if isinstance(num_ex, torch.Tensor) else int(num_ex)
+                    e = _aggregate_chunked_embeddings(
+                        e, batch["owner_idx"].to(e.device), num_ex_int
+                    )
                 pred = reg(e)
                 loss = criterion(pred, batch["scores"]) 
                 val_loss += loss.item() * e.size(0)
@@ -305,6 +366,11 @@ def stage2_train_regressor(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter
 
     os.makedirs(cfg.out_dir, exist_ok=True)
     torch.save(reg.state_dict(), os.path.join(cfg.out_dir, "regressor.pt"))
+    if cfg.save_finetuned_backbone and any(p.requires_grad for p in backbone.parameters()):
+        try:
+            torch.save(backbone.model.state_dict(), os.path.join(cfg.out_dir, "backbone_finetuned.pt"))
+        except Exception as e:
+            print(f"[Warn] Failed to save finetuned backbone: {e}")
 
 
 def _export_embeddings_after_stage1(cfg: TrainConfig, backbone: Wav2Vec2Backbone, adapter: GatedLinearAdapter, aggregator: TemporalAggregator) -> None:

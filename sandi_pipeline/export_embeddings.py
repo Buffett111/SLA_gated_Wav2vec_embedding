@@ -25,11 +25,11 @@ from .model import (
 class ExportConfig:
     dataset_name: str = "ntnu-smil/sandi-corpus-2025"
     split: str = "dev"
-    model_name: str = "facebook/wav2vec2-base"
+    model_name: str = "facebook/wav2vec2-large-xlsr-53"
     out_dir: str = "./embeddings"
     adapter_path: str = "./outputs/adapter.pt"
     aggregator_path: str = "./outputs/aggregator.pt"
-    batch_size: int = 16
+    batch_size: int = 8
     max_seconds: Optional[float] = 30.0
     chunk_seconds: Optional[float] = 30.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,12 +65,15 @@ def export_embeddings(cfg: ExportConfig) -> None:
         with torch.no_grad():
             batch = {k: (v.to(cfg.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             frames = backbone(batch["input_values"], attention_mask=batch.get("attention_mask"))
+            frame_mask = backbone.make_frame_mask(batch.get("attention_mask"), frames)
             gated = adapter(frames)
-            e = aggregator(gated, attention_mask=batch.get("attention_mask"))
+            e = aggregator(gated, attention_mask=frame_mask)
             if "owner_idx" in batch and "num_examples" in batch:
                 # re-average chunks to utterance-level
                 from .train import _aggregate_chunked_embeddings
-                e = _aggregate_chunked_embeddings(e, batch["owner_idx"].to(e.device), int(batch["num_examples"]))
+                num_ex = batch["num_examples"]
+                num_ex_int = int(num_ex.item()) if isinstance(num_ex, torch.Tensor) else int(num_ex)
+                e = _aggregate_chunked_embeddings(e, batch["owner_idx"].to(e.device), num_ex_int)
 
         e_np = e.detach().cpu().numpy().astype("float32")
         for i in range(e_np.shape[0]):
