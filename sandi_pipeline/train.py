@@ -35,7 +35,7 @@ from .data import AudioCollator as _AudioCollator
 class TrainConfig:
     dataset_name: str = "ntnu-smil/sandi-corpus-2025"
     model_name: str = "facebook/wav2vec2-large-xlsr-53"
-    batch_size: int = 8
+    batch_size: int = 16
     max_seconds: Optional[float] = 30.0
     lr: float = 3e-4
     weight_decay: float = 0.01
@@ -83,6 +83,36 @@ def _aggregate_chunked_embeddings(e_chunks: torch.Tensor, owner_idx: torch.Tenso
     ones = torch.ones(e_chunks.size(0), 1, device=device)
     counts.index_add_(0, owner_idx, ones)
     return sums / counts.clamp(min=1e-6)
+
+
+@torch.no_grad()
+def _compute_alignment(e: torch.Tensor, a_idx: torch.Tensor, p_idx: torch.Tensor) -> torch.Tensor:
+    """Alignment metric: mean squared distance of positive pairs on the unit hypersphere.
+
+    Definition follows Wang & Isola (2020): E[|| z_i - z_j ||^2] over positives, with z = e / ||e||.
+    """
+    if a_idx.numel() == 0:
+        return torch.tensor(float("nan"), device=e.device)
+    z = e / (e.norm(dim=-1, keepdim=True).clamp(min=1e-6))
+    diffs = z[a_idx] - z[p_idx]
+    return (diffs.pow(2).sum(dim=-1)).mean()
+
+
+@torch.no_grad()
+def _compute_uniformity(e: torch.Tensor, t: float = 2.0) -> torch.Tensor:
+    """Uniformity metric: log E[exp(-t * || z_i - z_j ||^2)] over all pairs i!=j.
+
+    Uses normalized embeddings z; lower is more uniform. Computed within-batch.
+    """
+    if e.size(0) <= 1:
+        return torch.tensor(float("nan"), device=e.device)
+    z = e / (e.norm(dim=-1, keepdim=True).clamp(min=1e-6))
+    sim = torch.matmul(z, z.T)
+    dist_sq = (2.0 - 2.0 * sim).clamp(min=0.0)
+    n = dist_sq.size(0)
+    mask = ~torch.eye(n, dtype=torch.bool, device=e.device)
+    vals = dist_sq[mask]
+    return torch.log(torch.exp(-t * vals).mean())
 
 
 def compute_embeddings(backbone: Wav2Vec2Backbone, adapter: GatedLinearAdapter, aggregator: TemporalAggregator, batch):
@@ -179,6 +209,10 @@ def stage1_train_adapter(cfg: TrainConfig) -> tuple:
         total_loss = 0.0
         count = 0
         did_check = False
+        align_sum = 0.0
+        align_count = 0
+        unif_sum = 0.0
+        unif_count = 0
         for batch in train_loader:
             batch = {k: (v.to(cfg.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             # Backbone is frozen; run without grad to save memory
@@ -212,7 +246,24 @@ def stage1_train_adapter(cfg: TrainConfig) -> tuple:
 
             total_loss += loss.item() * len(trips)
             count += len(trips)
-        print(f"[Stage1][Epoch {epoch+1}/{cfg.epochs_adapter}] triplet_loss={total_loss / max(1, count):.4f}")
+
+            # Metrics
+            with torch.no_grad():
+                align = _compute_alignment(e, a_idx, p_idx)
+                if torch.isfinite(align):
+                    align_sum += float(align.item())
+                    align_count += 1
+                unif = _compute_uniformity(e)
+                if torch.isfinite(unif):
+                    unif_sum += float(unif.item())
+                    unif_count += 1
+        avg_loss = total_loss / max(1, count)
+        avg_align = (align_sum / max(1, align_count)) if align_count > 0 else float("nan")
+        avg_unif = (unif_sum / max(1, unif_count)) if unif_count > 0 else float("nan")
+        print(
+            f"[Stage1][Epoch {epoch+1}{cfg.epochs_adapter}] triplet_loss={avg_loss:.4f} "
+            f"alignment={avg_align:.4f} uniformity={avg_unif:.4f}"
+        )
 
     # Save adapter + aggregator
     torch.save(adapter.state_dict(), os.path.join(cfg.out_dir, "adapter.pt"))
