@@ -29,7 +29,7 @@ class ExportConfig:
     out_dir: str = "./embeddings"
     adapter_path: str = "./outputs/adapter.pt"
     aggregator_path: str = "./outputs/aggregator.pt"
-    batch_size: int = 16
+    batch_size: int = 8
     max_seconds: Optional[float] = 30.0
     chunk_seconds: Optional[float] = 30.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

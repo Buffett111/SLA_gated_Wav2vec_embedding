@@ -35,7 +35,7 @@ from .data import AudioCollator as _AudioCollator
 class TrainConfig:
     dataset_name: str = "ntnu-smil/sandi-corpus-2025"
     model_name: str = "facebook/wav2vec2-large-xlsr-53"
-    batch_size: int = 16
+    batch_size: int = 8
     max_seconds: Optional[float] = 30.0
     lr: float = 3e-4
     weight_decay: float = 0.01
